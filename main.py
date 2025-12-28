@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
+from xml.etree import ElementTree as ET
 
 app = FastAPI(title="MT5 US News Blackout Bridge")
 
@@ -12,18 +13,21 @@ app = FastAPI(title="MT5 US News Blackout Bridge")
 # ENV
 # =========================
 BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "")
-TE_API_KEY = os.getenv("TE_API_KEY", "")  # Trading Economics API key
 
 # Blackout window (minutes)
 DEFAULT_PRE_MIN = int(os.getenv("PRE_MINUTES", "10"))
 DEFAULT_POST_MIN = int(os.getenv("POST_MINUTES", "30"))
 
-# Cache
+# Cache to reduce upstream hits
 _CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
-CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "60"))
+CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "300"))  # 5 min default
 
-# Trading Economics US calendar endpoint
-TE_US_CAL_URL = "https://api.tradingeconomics.com/calendar/country/united%20states"
+# ForexFactory calendar XML (via faireconomy)
+# We will parse events and filter USD high impact.
+FF_THISWEEK_URL = os.getenv(
+    "FF_CAL_URL",
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+)
 
 # =========================
 # HELPERS
@@ -31,12 +35,19 @@ TE_US_CAL_URL = "https://api.tradingeconomics.com/calendar/country/united%20stat
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-def _parse_te_date(s: str) -> Optional[datetime]:
+def _safe_text(el: Optional[ET.Element]) -> str:
+    return (el.text or "").strip() if el is not None else ""
+
+def _parse_epoch_utc(s: str) -> Optional[datetime]:
+    """
+    Some FF XML feeds include <timestamp> as epoch seconds.
+    If present, use it (best).
+    """
     try:
-        dt = datetime.fromisoformat(s.replace("Z", ""))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        if not s:
+            return None
+        ts = int(float(s))
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
     except Exception:
         return None
 
@@ -49,57 +60,78 @@ def _is_blackout(now: datetime, event_time: datetime, pre_min: int, post_min: in
 # CALENDAR FETCH
 # =========================
 async def _fetch_us_high_impact_events() -> List[Dict[str, Any]]:
-    if not TE_API_KEY:
-        raise HTTPException(status_code=500, detail="Missing TE_API_KEY in Railway Variables")
-
+    # Cache
     now_ts = time.time()
     if _CACHE["data"] is not None and (now_ts - _CACHE["ts"]) < CACHE_TTL_SEC:
         return _CACHE["data"]
 
-    params = {
-        "c": TE_API_KEY,
-        "f": "json"
-    }
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.get(TE_US_CAL_URL, params=params)
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        r = await client.get(FF_THISWEEK_URL)
 
         if r.status_code != 200:
-            upstream_body = (r.text or "")[:500]
+            upstream_body = (r.text or "")[:300]
             raise HTTPException(
                 status_code=502,
                 detail=f"Calendar upstream error: {r.status_code} | {upstream_body}"
             )
 
-        try:
-            data = r.json()
-        except Exception:
-            upstream_body = (r.text or "")[:500]
-            raise HTTPException(
-                status_code=502,
-                detail=f"Upstream returned non-JSON | {upstream_body}"
-            )
+    xml_text = r.text
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        upstream_body = (xml_text or "")[:300]
+        raise HTTPException(status_code=502, detail=f"Upstream returned invalid XML | {upstream_body}")
 
-        if not isinstance(data, list):
-            raise HTTPException(
-                status_code=502,
-                detail="Unexpected calendar response format"
-            )
+    events: List[Dict[str, Any]] = []
 
-    # Filter HIGH IMPACT (Importance >= 3)
-    high: List[Dict[str, Any]] = []
-    for ev in data:
-        try:
-            imp = int(ev.get("Importance", 0))
-        except Exception:
-            imp = 0
+    # Common structure: <weeklyevents><event>...</event></weeklyevents>
+    for ev in root.findall(".//event"):
+        # ForexFactory feeds typically tag currency as USD for US events
+        currency = _safe_text(ev.find("currency")) or _safe_text(ev.find("country"))
+        impact = _safe_text(ev.find("impact"))
 
-        if imp >= 3:
-            high.append(ev)
+        # Keep it strict: US = USD and High impact
+        if currency.upper() != "USD":
+            continue
+        if impact.lower() != "high":
+            continue
+
+        title = _safe_text(ev.find("title")) or _safe_text(ev.find("event"))
+        timestamp = _safe_text(ev.find("timestamp"))  # best-case
+        dt = _parse_epoch_utc(timestamp)
+
+        # If no timestamp exists, try date+time (fallback).
+        # Some feeds have <date> and <time> but timezone can vary; timestamp is preferred.
+        if dt is None:
+            date_s = _safe_text(ev.find("date"))
+            time_s = _safe_text(ev.find("time"))
+            try:
+                # Fallback assumes UTC if no tz info (less ideal but usable)
+                # Expected formats vary; keep conservative.
+                # If parsing fails, skip.
+                if date_s and time_s and time_s.lower() not in ("all day", "tentative"):
+                    # Try: YYYY-MM-DD + HH:MM
+                    # If date is like "2025-12-28"
+                    dt_guess = datetime.fromisoformat(f"{date_s}T{time_s}:00")
+                    dt = dt_guess.replace(tzinfo=timezone.utc)
+            except Exception:
+                dt = None
+
+        if dt is None:
+            continue
+
+        events.append(
+            {
+                "event": title,
+                "currency": "USD",
+                "impact": "High",
+                "event_time_utc": dt,
+            }
+        )
 
     _CACHE["ts"] = now_ts
-    _CACHE["data"] = high
-    return high
+    _CACHE["data"] = events
+    return events
 
 # =========================
 # ROUTES
@@ -120,27 +152,27 @@ async def us_news_status(
     now = _now_utc()
     events = await _fetch_us_high_impact_events()
 
+    # Find any event currently in blackout
     for ev in events:
-        dt = _parse_te_date(str(ev.get("Date", "")))
-        if not dt:
-            continue
-
+        dt: datetime = ev["event_time_utc"]
         if _is_blackout(now, dt, pre_minutes, post_minutes):
             end_ts = dt.timestamp() + (post_minutes * 60)
             minutes_to_clear = max(0, int((end_ts - now.timestamp()) / 60))
-
             return {
                 "us_news_blackout": True,
-                "event": ev.get("Event", ""),
-                "category": ev.get("Category", ""),
+                "event": ev.get("event", ""),
+                "currency": "USD",
+                "impact": "High",
                 "event_time_utc": dt.isoformat(),
                 "minutes_to_clear": minutes_to_clear,
                 "pre_minutes": pre_minutes,
                 "post_minutes": post_minutes,
+                "source": "ff_thisweek_xml",
             }
 
     return {
         "us_news_blackout": False,
         "pre_minutes": pre_minutes,
         "post_minutes": post_minutes,
+        "source": "ff_thisweek_xml",
     }
